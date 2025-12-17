@@ -141,35 +141,112 @@ const COIN_METADATA = {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", coins: COINS.length, timestamp: new Date().toISOString() });
+  res.json({ 
+    status: "ok", 
+    coins: COINS.length, 
+    cached: Object.keys(priceCache).length > 0,
+    lastCacheUpdate: lastCacheUpdate ? new Date(lastCacheUpdate).toISOString() : null,
+    timestamp: new Date().toISOString() 
+  });
 });
 
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({ 
+    service: "Crypto Price Proxy",
+    version: "1.0.0",
+    endpoints: {
+      prices: "/prices",
+      health: "/health"
+    },
+    coins: COINS.length
+  });
+});
+
+// Cache for prices (fallback if CoinGecko fails)
+let priceCache = {};
+let lastCacheUpdate = 0;
+const CACHE_DURATION = 60000; // 1 minute cache
+
 app.get("/prices", async (req, res) => {
+  console.log(`[${new Date().toISOString()}] Price request received from ${req.ip || req.connection.remoteAddress}`);
+  
   try {
-    // Set timeout for CoinGecko API request
-    const response = await axios.get(
-      "https://api.coingecko.com/api/v3/simple/price",
-      {
-        params: {
-          ids: COINS.join(","),
-          vs_currencies: "usd",
-          include_24hr_change: true,
-          include_market_cap: true
-        },
-        timeout: 10000 // 10 second timeout
+    // Split coins into batches to avoid rate limits (CoinGecko has limits)
+    const BATCH_SIZE = 50; // CoinGecko recommends max 50 coins per request
+    const batches = [];
+    
+    for (let i = 0; i < COINS.length; i += BATCH_SIZE) {
+      batches.push(COINS.slice(i, i + BATCH_SIZE));
+    }
+    
+    console.log(`Fetching prices for ${COINS.length} coins in ${batches.length} batch(es)...`);
+    
+    const allPrices = {};
+    
+    // Fetch prices in batches
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const coinIds = batch.join(",");
+      
+      console.log(`Fetching batch ${i + 1}/${batches.length} (${batch.length} coins)...`);
+      
+      try {
+        const response = await axios.get(
+          "https://api.coingecko.com/api/v3/simple/price",
+          {
+            params: {
+              ids: coinIds,
+              vs_currencies: "usd",
+              include_24hr_change: true,
+              include_market_cap: true
+            },
+            timeout: 15000, // 15 second timeout
+            headers: {
+              'Accept': 'application/json',
+              'User-Agent': 'CryptoRNG-Proxy/1.0'
+            }
+          }
+        );
+        
+        if (response.data) {
+          Object.assign(allPrices, response.data);
+          console.log(`✅ Batch ${i + 1} successful: ${Object.keys(response.data).length} coins`);
+        }
+        
+        // Small delay between batches to avoid rate limiting
+        if (i < batches.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      } catch (batchError) {
+        console.error(`❌ Batch ${i + 1} failed:`, batchError.message);
+        // Continue with other batches even if one fails
       }
-    );
+    }
+    
+    if (Object.keys(allPrices).length === 0) {
+      throw new Error("No prices fetched from any batch");
+    }
+    
+    console.log(`Total coins fetched: ${Object.keys(allPrices).length}/${COINS.length}`);
 
     // Validate response
-    if (!response.data || Object.keys(response.data).length === 0) {
-      console.warn("Empty response from CoinGecko");
+    if (Object.keys(allPrices).length === 0) {
+      console.warn("Empty response from CoinGecko, using cache if available");
+      if (Object.keys(priceCache).length > 0 && (Date.now() - lastCacheUpdate) < CACHE_DURATION) {
+        console.log("Returning cached prices");
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET');
+        res.setHeader('Content-Type', 'application/json');
+        return res.json(priceCache);
+      }
       return res.status(503).json({ error: "No price data available" });
     }
 
     // Transform response to match Roblox game's expected format
     const transformedData = {};
     
-    for (const [coinId, data] of Object.entries(response.data)) {
+    for (const [coinId, data] of Object.entries(allPrices)) {
       const metadata = COIN_METADATA[coinId] || { symbol: coinId.toUpperCase(), name: coinId };
       
       transformedData[coinId] = {
@@ -184,6 +261,11 @@ app.get("/prices", async (req, res) => {
       };
     }
 
+    // Update cache
+    priceCache = transformedData;
+    lastCacheUpdate = Date.now();
+    console.log(`✅ Successfully fetched and cached prices for ${Object.keys(transformedData).length} coins`);
+
     // Add CORS headers for Roblox
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -191,19 +273,36 @@ app.get("/prices", async (req, res) => {
     
     res.json(transformedData);
   } catch (error) {
-    console.error("Error fetching prices:", error.message);
+    console.error(`[${new Date().toISOString()}] Error fetching prices:`, error.message);
+    
+    // Try to return cached data if available
+    if (Object.keys(priceCache).length > 0 && (Date.now() - lastCacheUpdate) < CACHE_DURATION * 2) {
+      console.log("Returning cached prices due to error");
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET');
+      res.setHeader('Content-Type', 'application/json');
+      return res.json(priceCache);
+    }
     
     // Return appropriate status code
     if (error.response) {
       // CoinGecko API error
-      console.error("CoinGecko API error:", error.response.status, error.response.data);
-      res.status(502).json({ error: "CoinGecko API error", status: error.response.status });
+      console.error("CoinGecko API error:", error.response.status, JSON.stringify(error.response.data));
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.status(502).json({ 
+        error: "CoinGecko API error", 
+        status: error.response.status,
+        message: error.response.data?.error || error.message
+      });
     } else if (error.request) {
       // Request made but no response
-      console.error("No response from CoinGecko");
-      res.status(504).json({ error: "Request timeout" });
+      console.error("No response from CoinGecko - timeout or network issue");
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.status(504).json({ error: "Request timeout", message: "CoinGecko did not respond" });
     } else {
       // Other error
+      console.error("Unexpected error:", error);
+      res.setHeader('Access-Control-Allow-Origin', '*');
       res.status(500).json({ error: "Failed to fetch prices", message: error.message });
     }
   }
