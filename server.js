@@ -139,8 +139,14 @@ const COIN_METADATA = {
   "verge": { symbol: "XVG", name: "Verge" }
 };
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", coins: COINS.length, timestamp: new Date().toISOString() });
+});
+
 app.get("/prices", async (req, res) => {
   try {
+    // Set timeout for CoinGecko API request
     const response = await axios.get(
       "https://api.coingecko.com/api/v3/simple/price",
       {
@@ -149,9 +155,16 @@ app.get("/prices", async (req, res) => {
           vs_currencies: "usd",
           include_24hr_change: true,
           include_market_cap: true
-        }
+        },
+        timeout: 10000 // 10 second timeout
       }
     );
+
+    // Validate response
+    if (!response.data || Object.keys(response.data).length === 0) {
+      console.warn("Empty response from CoinGecko");
+      return res.status(503).json({ error: "No price data available" });
+    }
 
     // Transform response to match Roblox game's expected format
     const transformedData = {};
@@ -171,16 +184,52 @@ app.get("/prices", async (req, res) => {
       };
     }
 
+    // Add CORS headers for Roblox
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
+    res.setHeader('Content-Type', 'application/json');
+    
     res.json(transformedData);
   } catch (error) {
     console.error("Error fetching prices:", error.message);
-    res.status(500).json({ error: "Failed to fetch prices" });
+    
+    // Return appropriate status code
+    if (error.response) {
+      // CoinGecko API error
+      console.error("CoinGecko API error:", error.response.status, error.response.data);
+      res.status(502).json({ error: "CoinGecko API error", status: error.response.status });
+    } else if (error.request) {
+      // Request made but no response
+      console.error("No response from CoinGecko");
+      res.status(504).json({ error: "Request timeout" });
+    } else {
+      // Other error
+      res.status(500).json({ error: "Failed to fetch prices", message: error.message });
+    }
   }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Don't exit, let the process continue
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ Crypto price proxy server running on port ${PORT}`);
   console.log(`📊 Supporting ${COINS.length} cryptocurrencies`);
+  console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+  console.log(`💰 Prices endpoint: http://localhost:${PORT}/prices`);
 });
 
