@@ -1,9 +1,9 @@
 {
   "name": "cryptoserver",
   "version": "1.0.0",
-  "main": "proxy-server.js",
+  "main": "server.js",
   "scripts": {
-    "start": "node proxy-server.js"
+    "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
